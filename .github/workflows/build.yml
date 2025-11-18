@@ -2,9 +2,10 @@ name: Build
 
 on:
   push:
-    branches: [ "dev" ]
+    branches: [ "dev", "fix/macos-universal-binary-v2" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -87,24 +88,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: "v2-macos-universal-static-ssl"
-      - name: Build for x86_64 (Intel)
-        run: cargo build --release --target x86_64-apple-darwin --package config_app
-        env:
-          # Enable verbose OpenSSL build output for debugging
-          OPENSSL_STATIC: "1"
-      - name: Build for aarch64 (Apple Silicon)
-        run: cargo build --release --target aarch64-apple-darwin --package config_app
-        env:
-          OPENSSL_STATIC: "1"
+      - name: Build for both architectures in parallel
+        run: |
+          echo "Starting parallel builds for x86_64 and aarch64..."
+
+          # Build x86_64 in background
+          OPENSSL_STATIC=1 cargo build --release --target x86_64-apple-darwin --package config_app &
+          PID_X86=$!
+          echo "x86_64 build started (PID: $PID_X86)"
+
+          # Build aarch64 in background
+          OPENSSL_STATIC=1 cargo build --release --target aarch64-apple-darwin --package config_app &
+          PID_ARM=$!
+          echo "aarch64 build started (PID: $PID_ARM)"
+
+          # Wait for both to finish
+          echo "Waiting for builds to complete..."
+          wait $PID_X86 || { echo "ERROR: x86_64 build failed"; exit 1; }
+          echo "SUCCESS: x86_64 build completed"
+
+          wait $PID_ARM || { echo "ERROR: aarch64 build failed"; exit 1; }
+          echo "SUCCESS: aarch64 build completed"
+
+          echo "Both architecture builds finished successfully"
       - name: Create Universal Binary
         run: |
-          mkdir -p target/release
+          mkdir -p target/universal
           lipo -create \
             target/x86_64-apple-darwin/release/config_app \
             target/aarch64-apple-darwin/release/config_app \
-            -output target/release/config_app
+            -output target/universal/config_app
           echo "Universal binary created. Verifying architectures:"
-          lipo -info target/release/config_app
+          lipo -info target/universal/config_app
       # TODO: Code signing with Apple Developer Certificate
       # Requires: Apple Developer Account ($99/year) and certificates in GitHub Secrets
       # Uncomment and configure the following steps when certificate is available:
@@ -133,10 +148,37 @@ jobs:
       # xattr -cr Ultimate-NAG52-Config-App.app
       - name: Create .app bundle with cargo-bundle
         run: |
-          # cargo-bundle expects binary in target/release/
+          # cargo-bundle will rebuild for host arch (ARM64) and may clean target/release/
+          # Our universal binary is safely stored in target/universal/
           cargo bundle --release --package config_app
+          echo "Bundle created. Now replacing with universal binary..."
+
+          # Verify universal binary still exists
+          if [ ! -f "target/universal/config_app" ]; then
+            echo "ERROR: Universal binary not found at target/universal/config_app"
+            exit 1
+          fi
+
+          # Replace the bundled binary with our universal binary
+          cp -v target/universal/config_app \
+             "target/release/bundle/osx/Ultimate-NAG52-Config-App.app/Contents/MacOS/config_app"
+
           echo "Bundle contents:"
-          ls -R target/release/bundle/osx/
+          ls -lh target/release/bundle/osx/Ultimate-NAG52-Config-App.app/Contents/MacOS/
+      - name: Verify Universal Binary in .app bundle
+        run: |
+          echo "Verifying that .app contains universal binary..."
+          LIPO_OUTPUT=$(lipo -info "target/release/bundle/osx/Ultimate-NAG52-Config-App.app/Contents/MacOS/config_app")
+          echo "$LIPO_OUTPUT"
+
+          # Check if output contains both architectures
+          if echo "$LIPO_OUTPUT" | grep -q "x86_64" && echo "$LIPO_OUTPUT" | grep -q "arm64"; then
+            echo "SUCCESS: Universal binary verified (x86_64 + arm64)"
+          else
+            echo "FAILURE: Binary is NOT universal!"
+            echo "Expected both 'x86_64' and 'arm64' in lipo output"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: config-app-osx
