@@ -361,13 +361,13 @@ impl Nag52Diag {
     where
         F: FnMut(&DynamicDiagSession) -> DiagServerResult<X>,
     {
-        if self.server_mutex.lock().is_ok() {
-            match self.server.borrow() {
-                None => Err(DiagError::from(Arc::new(HardwareError::DeviceNotOpen))),
-                Some(s) => kwp_fn(&s),
-            }
-        } else {
-            Err(DiagError::ServerNotRunning)
+        let _guard = self
+            .server_mutex
+            .lock()
+            .map_err(|_| DiagError::ServerNotRunning)?;
+        match self.server.borrow() {
+            None => Err(DiagError::from(Arc::new(HardwareError::DeviceNotOpen))),
+            Some(s) => kwp_fn(&s),
         }
     }
 

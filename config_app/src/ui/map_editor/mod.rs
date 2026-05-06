@@ -8,7 +8,7 @@ use backend::{
 };
 use eframe::{
     egui::{
-        self, DragValue, Layout, MenuBar, RichText, ScrollArea, Ui
+        self, DragValue, Layout, MenuBar, RichText, ScrollArea
     }, epaint::Color32,
 };
 use egui_plot::{Bar, BarChart, Line};
@@ -16,8 +16,10 @@ use egui_extras::Column;
 use plotters::{prelude::{IntoDrawingArea, ChartBuilder}, series::SurfaceSeries};
 use serde::Serialize;
 mod help_view;
+mod live_context;
 mod map_list;
 use crate::{plot_backend::{into_rgba_color, EguiPlotBackend}, ui::map_editor::map_list::MapType, window::PageAction};
+use live_context::MapLiveContextState;
 use map_list::MAP_ARRAY;
 use plotters::prelude::*;
 
@@ -715,6 +717,7 @@ pub struct MapEditor {
     nag: Nag52Diag,
     loaded_map: Option<Map>,
     error: Option<String>,
+    live_context: MapLiveContextState,
 }
 
 impl MapEditor {
@@ -724,6 +727,7 @@ impl MapEditor {
             nag,
             loaded_map: None,
             error: None,
+            live_context: MapLiveContextState::default(),
         }
     }
 }
@@ -829,6 +833,9 @@ impl super::InterfacePage for MapEditor {
                     }
                 });
             });
+            if ui.button("Live data").clicked() {
+                self.live_context.open(&self.nag);
+            }
         });
         if let Some(selected) = map_to_switch {
             // Stop user changing maps if they have unsaved changes
@@ -873,6 +880,8 @@ impl super::InterfacePage for MapEditor {
         } else {
             ui.centered_and_justified(|ui| ui.strong("Please select a map"));
         }
+        self.live_context
+            .show_modal(ui.ctx(), &self.nag, action.is_some());
         if let Some(act) = action {
             act
         } else {

@@ -8,6 +8,7 @@ use backend::ecu_diagnostics::{DiagError, DiagServerResult};
 use eframe::egui::{self, Color32, RichText, ScrollArea, Ui, WidgetText};
 use packed_struct::PackedStructSlice;
 use packed_struct::prelude::{PackedStruct, PrimitiveEnum_u8};
+use crate::ui::diagnostic_format::{gear_state_label, profile_label, tcc_state_label};
 
 #[repr(u8)]
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Debug, strum_macros::VariantArray)]
@@ -428,41 +429,8 @@ impl LocalRecordData {
                         let targ = (s.targ_act_gear >> 4) & 0x0F;
                         let actual = s.targ_act_gear & 0x0F;
 
-                        fn geartext(b: u8) -> &'static str {
-                            match b {
-                                1 => "1",
-                                2 => "2",
-                                3 => "3",
-                                4 => "4",
-                                5 => "5",
-                                8 => "P",
-                                9 => "N",
-                                10 => "R1",
-                                11 => "R2",
-                                _ => "UNKNOWN"
-                            }
-                        }
-
-                        let state_text = if targ == actual {
-                            geartext(actual).to_string()
-                        } else {
-                            format!("{} -> {}", geartext(actual), geartext(targ))
-                        };
-                        make_row(ui, "Gear", state_text);
-
-                        let profile = match s.profile_id {
-                            0 => "(S)tandard",
-                            1 => "(C)omfort",
-                            2 => "(W)inter",
-                            3 => "(A)gility",
-                            4 => "(M)anual",
-                            5 => "(R)ace",
-                            6 => "(I)ndividual",
-                            7 => "_Init",
-                            _ => "UNKNOWN"
-                        };
-
-                        make_row(ui, "Profile", profile);
+                        make_row(ui, "Gear", gear_state_label(actual, targ));
+                        make_row(ui, "Profile", profile_label(s.profile_id));
                     },
                     LocalRecordData::ClutchSpeeds(s) => {
 
@@ -493,8 +461,8 @@ impl LocalRecordData {
                         }
                     },
                     LocalRecordData::TccProgram(s) => {
-                        make_row(ui, "Target state", tcc_state_to_name(s.targ_state));
-                        make_row(ui, "Current state", tcc_state_to_name(s.current_state));
+                        make_row(ui, "Target state", tcc_state_label(s.targ_state));
+                        make_row(ui, "Current state", tcc_state_label(s.current_state));
 
                         make_row(ui, "Target pressure", format!("{} mBar", s.target_pressure));
                         make_row(ui, "Current pressure", format!("{} mBar", s.current_pressure));
@@ -803,15 +771,6 @@ impl LocalRecordData {
             },
         }
     }
-}
-
-fn tcc_state_to_name(i: u8) -> &'static str {
-    match i {
-        0 => "Open",
-        1 => "Slipping",
-        2 => "Closed",
-        _ => "Unknown"
-    }    
 }
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, PackedStruct)]

@@ -1,6 +1,7 @@
 use crate::window::InterfacePage;
 
 pub mod configuration;
+pub mod diagnostic_format;
 pub mod diagnostics;
 pub mod launcher;
 pub mod main;
