@@ -371,6 +371,19 @@ impl Nag52Diag {
         }
     }
 
+    pub fn try_with_kwp<F, X>(&self, mut kwp_fn: F) -> DiagServerResult<Option<X>>
+    where
+        F: FnMut(&DynamicDiagSession) -> DiagServerResult<X>,
+    {
+        let Ok(_guard) = self.server_mutex.try_lock() else {
+            return Ok(None);
+        };
+        match self.server.borrow() {
+            None => Err(DiagError::from(Arc::new(HardwareError::DeviceNotOpen))),
+            Some(s) => kwp_fn(&s).map(Some),
+        }
+    }
+
     pub fn get_data_rate(&self) -> Option<(u32, u32)> {
         self.endpoint.as_ref().map(|x| x.get_data_rate()).unwrap_or_else(|| None)
     }

@@ -1,15 +1,21 @@
-use std::time::{Duration, Instant};
-
-use backend::{
-    diag::Nag52Diag,
-    ecu_diagnostics::{DiagError, DiagServerResult},
+use std::{
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::{Duration, Instant},
 };
-use eframe::egui::{self, Color32, Grid, Ui};
-use packed_struct::{PackedStructSlice, prelude::PackedStruct};
+
+use backend::diag::Nag52Diag;
 use crate::ui::diagnostic_format::{bool_u8_label, gear_label, profile_label, tcc_state_label};
+use eframe::egui::{self, Color32, Grid, Ui};
+use packed_struct::{prelude::PackedStruct, PackedStructSlice};
 
 const RLI_MAP_LIVE_CONTEXT: u8 = 0x26;
+const PAYLOAD_SIZE: usize = 30;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+const BACKOFF_INTERVAL: Duration = Duration::from_millis(1000);
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(1000);
+const BACKOFF_AFTER_ERRORS: u8 = 3;
+const DISABLE_AFTER_ERRORS: u8 = 5;
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, PackedStruct)]
 #[packed_struct(endian = "lsb")]
@@ -36,10 +42,28 @@ pub struct MapLiveContext {
 }
 
 impl MapLiveContext {
-    fn read(nag: &Nag52Diag) -> DiagServerResult<Self> {
-        let response =
-            nag.with_kwp(|server| server.kwp_read_custom_local_identifier(RLI_MAP_LIVE_CONTEXT))?;
-        Self::unpack_from_slice(&response).map_err(|_| DiagError::InvalidResponseLength)
+    fn read(nag: &Nag52Diag) -> LiveContextPollResult {
+        match nag.try_with_kwp(|server| {
+            server.kwp_read_custom_local_identifier(RLI_MAP_LIVE_CONTEXT)
+        }) {
+            Ok(Some(response)) => {
+                if response.len() != PAYLOAD_SIZE {
+                    LiveContextPollResult::Error(format!(
+                        "Invalid live data payload size: got {}, expected {}",
+                        response.len(),
+                        PAYLOAD_SIZE
+                    ))
+                } else {
+                    Self::unpack_from_slice(&response)
+                        .map(LiveContextPollResult::Data)
+                        .unwrap_or_else(|_| {
+                            LiveContextPollResult::Error("Failed to parse live data payload".into())
+                        })
+                }
+            }
+            Ok(None) => LiveContextPollResult::Busy,
+            Err(err) => LiveContextPollResult::Error(err.to_string()),
+        }
     }
 
     fn flag_is_set(&self, bit: u8) -> bool {
@@ -47,18 +71,58 @@ impl MapLiveContext {
     }
 }
 
-#[derive(Default)]
+enum LiveContextPollResult {
+    Data(MapLiveContext),
+    Busy,
+    Error(String),
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum PollState {
+    Idle,
+    InFlight,
+    Backoff,
+    Disabled,
+}
+
 pub struct MapLiveContextState {
     open: bool,
     context: Option<MapLiveContext>,
     error: Option<String>,
-    last_poll: Option<Instant>,
+    stale: bool,
+    state: PollState,
+    worker: Option<Receiver<LiveContextPollResult>>,
+    request_started: Option<Instant>,
+    request_timed_out: bool,
+    next_poll: Option<Instant>,
+    consecutive_errors: u8,
+}
+
+impl Default for MapLiveContextState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            context: None,
+            error: None,
+            stale: false,
+            state: PollState::Idle,
+            worker: None,
+            request_started: None,
+            request_timed_out: false,
+            next_poll: None,
+            consecutive_errors: 0,
+        }
+    }
 }
 
 impl MapLiveContextState {
     pub fn open(&mut self, nag: &Nag52Diag) {
         self.open = true;
-        self.poll(nag, true);
+        if self.state == PollState::Disabled {
+            self.state = PollState::Idle;
+            self.consecutive_errors = 0;
+        }
+        self.start_request(nag, true);
     }
 
     pub fn show_modal(&mut self, ctx: &egui::Context, nag: &Nag52Diag, skip_poll: bool) {
@@ -66,26 +130,30 @@ impl MapLiveContextState {
             return;
         }
 
+        self.collect_worker_result();
+        self.update_timeout();
         if !skip_poll {
-            self.poll(nag, false);
+            self.maybe_start_scheduled_request(nag);
         }
-        ctx.request_repaint_after(POLL_INTERVAL);
+        ctx.request_repaint_after(Duration::from_millis(50));
 
         egui::Modal::new(egui::Id::new("map-live-context-modal")).show(ctx, |ui| {
-            ui.set_min_width(520.0);
+            ui.set_min_width(560.0);
             ui.heading("Map live data");
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Refresh now").clicked() {
-                    self.poll(nag, true);
+                    self.start_request(nag, true);
                 }
                 if ui.button("Close").clicked() {
-                    self.open = false;
+                    self.close();
                 }
             });
 
+            self.show_status(ui);
+
             if let Some(error) = &self.error {
-                ui.colored_label(Color32::RED, error);
+                ui.colored_label(Color32::YELLOW, error);
             }
 
             if let Some(context) = self.context {
@@ -178,26 +246,162 @@ impl MapLiveContextState {
         });
     }
 
-    fn poll(&mut self, nag: &Nag52Diag, force: bool) {
-        let now = Instant::now();
-        let should_poll = force
-            || self
-                .last_poll
-                .map(|last| now.duration_since(last) >= POLL_INTERVAL)
-                .unwrap_or(true);
-        if !should_poll {
+    fn close(&mut self) {
+        self.open = false;
+        self.worker = None;
+        self.request_started = None;
+        self.request_timed_out = false;
+        if self.state == PollState::InFlight {
+            self.state = PollState::Idle;
+        }
+    }
+
+    fn maybe_start_scheduled_request(&mut self, nag: &Nag52Diag) {
+        if self.state == PollState::Disabled || self.state == PollState::InFlight {
             return;
         }
 
-        self.last_poll = Some(now);
-        match MapLiveContext::read(nag) {
-            Ok(context) => {
+        let now = Instant::now();
+        if self.next_poll.map(|next| now >= next).unwrap_or(true) {
+            self.start_request(nag, false);
+        }
+    }
+
+    fn start_request(&mut self, nag: &Nag52Diag, force: bool) {
+        self.collect_worker_result();
+        self.update_timeout();
+
+        if self.state == PollState::InFlight {
+            if force {
+                self.error = Some("Live data request already in flight; refresh skipped".into());
+                self.stale = self.context.is_some();
+            }
+            return;
+        }
+
+        if self.state == PollState::Disabled && !force {
+            return;
+        }
+
+        if force && self.state == PollState::Disabled {
+            self.state = PollState::Idle;
+            self.consecutive_errors = 0;
+        }
+
+        let nag = nag.clone();
+        let (tx, rx) = mpsc::channel();
+        let _ = thread::Builder::new()
+            .name("map-live-context-poll".into())
+            .spawn(move || {
+                let _ = tx.send(MapLiveContext::read(&nag));
+            });
+
+        self.worker = Some(rx);
+        self.request_started = Some(Instant::now());
+        self.request_timed_out = false;
+        self.state = PollState::InFlight;
+    }
+
+    fn collect_worker_result(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+
+        match worker.try_recv() {
+            Ok(result) => {
+                self.request_started = None;
+                self.request_timed_out = false;
+                self.apply_result(result);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.worker = Some(worker);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.request_started = None;
+                self.request_timed_out = false;
+                self.apply_error("Live data worker disconnected".into());
+            }
+        }
+    }
+
+    fn update_timeout(&mut self) {
+        if self.state != PollState::InFlight || self.request_timed_out {
+            return;
+        }
+
+        if self
+            .request_started
+            .map(|started| started.elapsed() >= REQUEST_TIMEOUT)
+            .unwrap_or(false)
+        {
+            self.request_timed_out = true;
+            self.stale = self.context.is_some();
+            self.error = Some(
+                "Live data request timed out; waiting for diagnostic call to finish".into(),
+            );
+        }
+    }
+
+    fn apply_result(&mut self, result: LiveContextPollResult) {
+        match result {
+            LiveContextPollResult::Data(context) => {
                 self.context = Some(context);
                 self.error = None;
+                self.stale = false;
+                self.consecutive_errors = 0;
+                self.state = PollState::Idle;
+                self.next_poll = Some(Instant::now() + POLL_INTERVAL);
             }
-            Err(err) => {
-                self.error = Some(err.to_string());
+            LiveContextPollResult::Busy => {
+                self.error = Some("Diagnostics busy; live data poll skipped".into());
+                self.stale = self.context.is_some();
+                self.state = PollState::Idle;
+                self.next_poll = Some(Instant::now() + POLL_INTERVAL);
             }
+            LiveContextPollResult::Error(error) => self.apply_error(error),
+        }
+    }
+
+    fn apply_error(&mut self, error: String) {
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+        self.error = Some(error);
+        self.stale = self.context.is_some();
+
+        if self.consecutive_errors >= DISABLE_AFTER_ERRORS {
+            self.state = PollState::Disabled;
+            self.error = Some(format!(
+                "Live data auto polling stopped after {} consecutive errors. Use Refresh now to retry.",
+                self.consecutive_errors
+            ));
+            self.next_poll = None;
+        } else {
+            let interval = if self.consecutive_errors >= BACKOFF_AFTER_ERRORS {
+                self.state = PollState::Backoff;
+                BACKOFF_INTERVAL
+            } else {
+                self.state = PollState::Idle;
+                POLL_INTERVAL
+            };
+            self.next_poll = Some(Instant::now() + interval);
+        }
+    }
+
+    fn show_status(&self, ui: &mut Ui) {
+        let status = match self.state {
+            PollState::Idle => "Polling: idle",
+            PollState::InFlight => "Polling: request in flight",
+            PollState::Backoff => "Polling: backoff",
+            PollState::Disabled => "Polling: disabled",
+        };
+        let color = match self.state {
+            PollState::Idle => ui.visuals().text_color(),
+            PollState::InFlight => Color32::LIGHT_BLUE,
+            PollState::Backoff => Color32::YELLOW,
+            PollState::Disabled => Color32::RED,
+        };
+        ui.colored_label(color, status);
+        if self.stale {
+            ui.colored_label(Color32::YELLOW, "Showing last valid snapshot");
         }
     }
 }
