@@ -37,7 +37,7 @@ jobs:
       run: cargo install cargo-appimage
     - name: Build executable
       working-directory: ./config_app
-      run: cargo build --verbose --release
+      run: cargo build --verbose --release --locked
     - name: Build appimage
       working-directory: ./config_app
       run: cargo appimage
@@ -64,7 +64,7 @@ jobs:
         shell: powershell
       - uses: Swatinem/rust-cache@v2
       - name: Build executable
-        run: cargo build --verbose --release --target i686-pc-windows-msvc
+        run: cargo build --verbose --release --locked --target i686-pc-windows-msvc
       - name: View artifacts
         run: ls target -R
       - uses: actions/upload-artifact@v7
@@ -89,7 +89,8 @@ jobs:
         run: cargo install cargo-bundle --version 0.12.0 --locked
       - name: Build Apple Silicon app and DMG
         run: |
-          cargo bundle --release --package config_app
+          cargo build --release --locked --package config_app
+          cargo bundle --release --package config_app --binary-path target/release/config_app
           mv target/release/bundle/dmg/Ultimate-NAG52-Config-App.dmg target/release/bundle/dmg/config_app.dmg
         env:
           OPENSSL_STATIC: "1"
