@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -107,6 +107,8 @@ jobs:
   Create-Upload:
     needs: [Windows-App, Linux-App, OSX-app]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
     - name: Download Windows artifact
       uses: actions/download-artifact@v8
