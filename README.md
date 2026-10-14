@@ -6,6 +6,8 @@ The configuration app for the Ultimate-NAG52 TCU
 
 ### macOS
 
+The macOS build supports Apple Silicon (M1 and newer); Intel Macs are not supported.
+
 #### ⚠️ IMPORTANT: App is not code-signed
 This app is not signed with an Apple Developer Certificate. macOS will show a security warning when you first try to open it.
 

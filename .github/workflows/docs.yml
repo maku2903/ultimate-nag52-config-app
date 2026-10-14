@@ -11,7 +11,7 @@ jobs:
   deploy_docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           rustup set auto-self-update disable
           rustup toolchain install stable --profile minimal
