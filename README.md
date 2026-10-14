@@ -54,3 +54,7 @@ to load the TCU Settings page, you will need `MODULE_SETTINGS.yml` file that is 
 ## Branch names
 
 The branches of this repository will follow the same branch names as the TCU firmware. Builds will only be avaliable for the main and dev branch. Other branches will need to be compiled manually
+
+## Checking a build without publishing
+
+In GitHub Actions, select **Build → Run workflow**, choose the branch, and leave **Publish a GitHub release after building** unchecked. Download the resulting packages from the run's **Artifacts** section. Publishing is disabled by default for manual runs; automatic builds on `dev` still publish prereleases.

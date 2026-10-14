@@ -6,6 +6,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub release after building
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -105,6 +110,7 @@ jobs:
           if-no-files-found: error
 
   Create-Upload:
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
     needs: [Windows-App, Linux-App, OSX-app]
     runs-on: ubuntu-latest
     permissions:
