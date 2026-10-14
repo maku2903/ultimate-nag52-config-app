@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [ "dev" ]
+    branches: [ "dev", "ci/macos-arm64-build-check-20261014" ]
   release:
     types: [published]
   workflow_dispatch:
@@ -110,7 +110,7 @@ jobs:
           if-no-files-found: error
 
   Create-Upload:
-    if: github.event_name != 'workflow_dispatch' || inputs.publish
+    if: github.ref_name != 'ci/macos-arm64-build-check-20261014' && (github.event_name != 'workflow_dispatch' || inputs.publish)
     needs: [Windows-App, Linux-App, OSX-app]
     runs-on: ubuntu-latest
     permissions:
