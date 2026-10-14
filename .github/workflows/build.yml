@@ -75,6 +75,8 @@ jobs:
   OSX-app:
     if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v')
     runs-on: macos-latest # Apple Silicon (ARM64)
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v7
       - run: |
@@ -84,7 +86,7 @@ jobs:
         run: test "$(uname -m)" = arm64
       - uses: Swatinem/rust-cache@v2
         with:
-          key: "v3-macos-arm64-static-ssl"
+          key: "v4-macos-arm64-static-ssl"
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --version 0.12.0 --locked
       - name: Build Apple Silicon app and DMG
@@ -94,10 +96,13 @@ jobs:
           mv target/release/bundle/dmg/Ultimate-NAG52-Config-App.dmg target/release/bundle/dmg/config_app.dmg
         env:
           OPENSSL_STATIC: "1"
+      - name: Verify macOS disk image and bundled executable
+        run: bash .github/scripts/verify-macos-dmg.sh target/release/bundle/dmg/config_app.dmg
       - uses: actions/upload-artifact@v7
         with:
           name: config-app-osx
           path: target/release/bundle/dmg/config_app.dmg
+          if-no-files-found: error
 
   Create-Upload:
     needs: [Windows-App, Linux-App, OSX-app]
