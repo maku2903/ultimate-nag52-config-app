@@ -97,7 +97,7 @@ jobs:
       - name: Build Apple Silicon app and DMG
         run: |
           cargo build --release --locked --package config_app
-          cargo bundle --release --package config_app --binary-path target/release/config_app
+          cargo bundle --release --package config_app --binary-path target/release/config_app --format dmg
           mv target/release/bundle/dmg/Ultimate-NAG52-Config-App.dmg target/release/bundle/dmg/config_app.dmg
         env:
           OPENSSL_STATIC: "1"
