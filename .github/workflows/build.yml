@@ -78,10 +78,19 @@ jobs:
         run: cargo build --verbose --release --locked --package config_app --bin config_app --target i686-pc-windows-msvc
       - name: View artifacts
         run: Get-Item target/i686-pc-windows-msvc/release/config_app.exe
+      - name: Install x86 DirectX Shader Compiler
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'dxc.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'dxc'
+          Invoke-WebRequest -Uri 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip' -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $destination 'bin\x86')
       - name: Verify Windows executable and application startup
         run: ./.github/scripts/verify-windows-exe.ps1 target/i686-pc-windows-msvc/release/config_app.exe
         env:
-          WGPU_DX12_COMPILER: Fxc
+          RUST_LOG: wgpu_hal=debug
+          WGPU_BACKEND: dx12
+          WGPU_DX12_COMPILER: Dxc
       - uses: actions/upload-artifact@v7
         with:
           name: config-app-exe
