@@ -50,11 +50,6 @@ if ($unexpectedDlls.Count -gt 0) {
 }
 Write-Host "DLL dependencies: $($dependencies -join ', ')"
 
-if ($env:RUNNER_ENVIRONMENT -eq 'github-hosted') {
-    Write-Warning 'Skipping GUI startup check: the GitHub-hosted Windows runner has no OpenGL 3.3-capable adapter.'
-    return
-}
-
 $stdout = [System.IO.Path]::GetTempFileName()
 $stderr = [System.IO.Path]::GetTempFileName()
 $process = $null
