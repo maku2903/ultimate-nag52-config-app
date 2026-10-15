@@ -11,13 +11,20 @@ on:
         description: Publish a GitHub release after building
         type: boolean
         default: false
+      release_channel:
+        description: Select main to test a stable release from this fork branch
+        type: choice
+        options:
+          - branch
+          - main
+        default: branch
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  BRANCH_NAME: ${{ github.head_ref || github.ref_name }} 
+  BRANCH_NAME: ${{ inputs.release_channel == 'main' && 'main' || github.head_ref || github.ref_name }}
 
 jobs:
   Linux-App:
