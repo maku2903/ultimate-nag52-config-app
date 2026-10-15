@@ -78,6 +78,8 @@ jobs:
         run: Get-Item target/i686-pc-windows-msvc/release/config_app.exe
       - name: Verify Windows executable and application startup
         run: ./.github/scripts/verify-windows-exe.ps1 target/i686-pc-windows-msvc/release/config_app.exe
+        env:
+          WGPU_DX12_COMPILER: Fxc
       - uses: actions/upload-artifact@v7
         with:
           name: config-app-exe
