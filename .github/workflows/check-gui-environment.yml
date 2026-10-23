@@ -1,0 +1,159 @@
+name: Check GUI environment failure handling
+'on':
+  push:
+    branches:
+    - ci/gui-environment-check-20261023
+permissions:
+  contents: read
+  actions: read
+jobs:
+  Linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+    - &id001
+      uses: actions/checkout@v4
+    - name: Install verifier dependencies
+      run: 'sudo apt-get update
+
+        sudo apt-get install -y desktop-file-utils libegl-mesa0 libgl1-mesa-dri libxkbcommon-x11-0 xauth xdotool
+        xvfb mesa-utils'
+    - uses: actions/download-artifact@v8
+      with:
+        name: config-app-linux
+        path: test-artifacts
+        github-token: ${{ github.token }}
+        repository: maku2903/ultimate-nag52-config-app
+        run-id: '38749635519'
+    - name: Test error classification
+      run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts/tests -v
+    - name: Verify real AppImage with unavailable OpenGL probe
+      run: 'chmod +x test-artifacts/config_app.AppImage
+
+        mkdir -p "$RUNNER_TEMP/no-gl"
+
+        printf ''#!/bin/sh
+
+        exit 1
+
+        '' > "$RUNNER_TEMP/no-gl/glxinfo"
+
+        chmod +x "$RUNNER_TEMP/no-gl/glxinfo"
+
+        PATH="$RUNNER_TEMP/no-gl:$PATH" bash .github/scripts/verify-linux-appimage.sh test-artifacts/config_app.AppImage'
+    - name: Verify real Linux application startup
+      run: bash .github/scripts/verify-linux-appimage.sh test-artifacts/config_app.AppImage
+      env:
+        WGPU_BACKEND: gl
+    - uses: actions/upload-artifact@v7
+      with:
+        name: verified-linux
+        path: test-artifacts/config_app.AppImage
+        if-no-files-found: error
+  Windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference
+          = $true; . '{0}'"
+    steps:
+    - *id001
+    - uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: win32
+    - uses: actions/download-artifact@v8
+      with:
+        name: config-app-exe
+        path: target/i686-pc-windows-msvc/release
+        github-token: ${{ github.token }}
+        repository: maku2903/ultimate-nag52-config-app
+        run-id: '38749635519'
+    - name: Verify real executable with unavailable Mesa
+      run: ./.github/scripts/verify-windows-exe.ps1 target/i686-pc-windows-msvc/release/config_app.exe
+      env:
+        SKIP_GUI_STARTUP: '1'
+    - name: Install Mesa llvmpipe for Windows GUI smoke test
+      id: mesa
+      run: "$archive = Join-Path $env:RUNNER_TEMP 'mesa-llvmpipe-x86-26.2.5.7z'\n$mesaDir = Join-Path $env:RUNNER_TEMP\
+        \ 'mesa-llvmpipe-x86'\n$sevenZip = Join-Path $env:RUNNER_TEMP '7zr.exe'\n$releaseDir = (Resolve-Path 'target/i686-pc-windows-msvc/release').Path\n\
+        $mesaDll = Join-Path $releaseDir 'opengl32.dll'\n$url = 'https://github.com/mmozeiko/build-mesa/releases/download/26.2.5/mesa-llvmpipe-x86-26.2.5.7z'\n\
+        $sha256 = '1858bce8a19c5d337dc4c9db039ef5e2f98d82dbb6e100dbe51564e8bc3572a4'\n$sevenZipUrl = 'https://github.com/ip7z/7zip/releases/download/26.04/7zr.exe'\n\
+        $sevenZipSha256 = '256feca8e274e5da655e2a284fabafd9f554365eb164862089dacd4e8276d282'\n\nInvoke-WebRequest\
+        \ -Uri $url -OutFile $archive\nif ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $sha256)\
+        \ {\n  throw 'Mesa llvmpipe archive SHA-256 does not match the pinned release.'\n}\nInvoke-WebRequest -Uri\
+        \ $sevenZipUrl -OutFile $sevenZip\nif ((Get-FileHash -LiteralPath $sevenZip -Algorithm SHA256).Hash -ne\
+        \ $sevenZipSha256) {\n  throw '7-Zip extractor SHA-256 does not match the pinned release.'\n}\n\nif (Test-Path\
+        \ -LiteralPath $mesaDll) {\n  throw \"Unexpected OpenGL runtime already exists: $mesaDll\"\n}\nNew-Item\
+        \ -ItemType Directory -Path $mesaDir -Force | Out-Null\n& $sevenZip x $archive \"-o$mesaDir\" -y\nif ($LASTEXITCODE\
+        \ -ne 0) {\n  throw 'Could not extract the pinned Mesa llvmpipe archive.'\n}\n$mesaSourceDll = Join-Path\
+        \ $mesaDir 'opengl32.dll'\nif (-not (Test-Path -LiteralPath $mesaSourceDll)) {\n  throw 'Mesa llvmpipe archive\
+        \ does not contain opengl32.dll.'\n}\nAdd-Content -Path $env:GITHUB_ENV -Value 'WGPU_BACKEND=gl'\nAdd-Content\
+        \ -Path $env:GITHUB_ENV -Value 'MESA_RUNTIME_INSTALLED=true'\nCopy-Item -LiteralPath $mesaSourceDll -Destination\
+        \ $mesaDll\n"
+    - name: Verify real Windows application startup
+      run: ./.github/scripts/verify-windows-exe.ps1 target/i686-pc-windows-msvc/release/config_app.exe
+    - name: Ensure application and executable failures still block
+      run: '$source = Join-Path $env:RUNNER_TEMP ''app-fails.c''
+
+        $binary = Join-Path $env:RUNNER_TEMP ''app-fails.exe''
+
+        Set-Content $source ''int main(void) { return 42; }''
+
+        cl.exe /nologo /MT $source "/Fe:$binary"
+
+        $detected = $false
+
+        try { ./.github/scripts/verify-windows-exe.ps1 $binary } catch { $detected = $true; Write-Host $_ }
+
+        if (-not $detected) { throw ''Application failure was not detected.'' }
+
+        $empty = Join-Path $env:RUNNER_TEMP ''empty.exe''
+
+        [System.IO.File]::WriteAllBytes($empty, [byte[]]@())
+
+        $env:SKIP_GUI_STARTUP = ''1''
+
+        $detected = $false
+
+        try { ./.github/scripts/verify-windows-exe.ps1 $empty } catch { $detected = $true; Write-Host $_ }
+
+        if (-not $detected) { throw ''Invalid executable was accepted when GUI was skipped.'' }'
+    - uses: actions/upload-artifact@v7
+      with:
+        name: verified-windows
+        path: target/i686-pc-windows-msvc/release/config_app.exe
+        if-no-files-found: error
+  macOS:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+    - *id001
+    - uses: actions/download-artifact@v8
+      with:
+        name: config-app-osx
+        path: test-artifacts
+        github-token: ${{ github.token }}
+        repository: maku2903/ultimate-nag52-config-app
+        run-id: '38749635519'
+    - name: Verify real DMG with unavailable desktop automation
+      run: 'mkdir -p "$RUNNER_TEMP/no-desktop"
+
+        printf ''#!/bin/sh
+
+        exit 1
+
+        '' > "$RUNNER_TEMP/no-desktop/osascript"
+
+        chmod +x "$RUNNER_TEMP/no-desktop/osascript"
+
+        PATH="$RUNNER_TEMP/no-desktop:$PATH" bash .github/scripts/verify-macos-dmg.sh test-artifacts/config_app.dmg'
+    - name: Verify real macOS application startup
+      run: bash .github/scripts/verify-macos-dmg.sh test-artifacts/config_app.dmg
+    - uses: actions/upload-artifact@v7
+      with:
+        name: verified-macos
+        path: test-artifacts/config_app.dmg
+        if-no-files-found: error
