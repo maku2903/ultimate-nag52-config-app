@@ -27,12 +27,14 @@ use plotters::{
 use serde::Serialize;
 mod help_view;
 mod map_list;
+mod map_state;
 use crate::{
     plot_backend::{EguiPlotBackend, into_rgba_color},
     ui::map_editor::map_list::MapType,
     window::PageAction,
 };
 use map_list::MAP_ARRAY;
+use map_state::MapState;
 use plotters::prelude::*;
 
 #[repr(u8)]
@@ -95,14 +97,9 @@ pub struct Map {
     x_values: Vec<i16>,
     y_values: Vec<i16>,
     eeprom_key: String,
-    /// EEPROM data
-    data_eeprom: Vec<i16>,
-    /// Map data in memory NOW
-    data_memory: Vec<i16>,
+    state: MapState,
     /// Program default map
     data_program: Vec<i16>,
-    /// User editing map
-    data_modify: Vec<i16>,
     ecu_ref: Nag52Diag,
     view_type: MapViewType,
     pitch: f64,
@@ -278,6 +275,7 @@ struct LookupCacheWorkerResult {
 enum PendingMapWrite {
     Ram,
     Eeprom,
+    RestoreEeprom,
 }
 
 #[derive(Debug)]
@@ -507,10 +505,8 @@ impl Map {
             x_values: x_elements,
             y_values: y_elements,
             eeprom_key: key,
-            data_eeprom: eeprom,
-            data_memory: current.clone(),
+            state: MapState::new(current, eeprom),
             data_program: default,
-            data_modify: current,
             meta,
             ecu_ref: nag,
             view_type: MapViewType::Modify,
@@ -540,7 +536,7 @@ impl Map {
             self.meta.id as u8,
             MapCmd::Write as u8,
         ];
-        payload.extend_from_slice(&self.data_to_byte_array(&self.data_modify));
+        payload.extend_from_slice(&self.data_to_byte_array(&self.state.edited));
         self.ecu_ref
             .with_kwp(|server| server.send_byte_array_with_response(&payload, None))?;
         Ok(())
@@ -1119,41 +1115,44 @@ impl Map {
     }
 
     fn perform_map_write(&mut self, write: PendingMapWrite) -> PageAction {
-        match write {
-            PendingMapWrite::Ram => match self.write_to_ram() {
-                Ok(_) => {
-                    self.data_memory = self.data_modify.clone();
-                    PageAction::SendNotification {
-                        text: format!("Map {} RAM write OK!", self.eeprom_key),
-                        kind: egui_toast::ToastKind::Success,
-                    }
+        if !matches!(write, PendingMapWrite::Ram) && self.state.has_local_edits() {
+            return PageAction::SendNotification {
+                text: "Undo local edits or write them to RAM first.".into(),
+                kind: egui_toast::ToastKind::Warning,
+            };
+        }
+        let result = match write {
+            PendingMapWrite::Ram => self.write_to_ram(),
+            PendingMapWrite::Eeprom => self.save_to_eeprom(),
+            PendingMapWrite::RestoreEeprom => self.undo_changes(),
+        };
+        let operation = match write {
+            PendingMapWrite::Ram => "RAM write",
+            PendingMapWrite::Eeprom => "EEPROM save",
+            PendingMapWrite::RestoreEeprom => "Restore RAM from EEPROM",
+        };
+        if let Err(e) = result {
+            return PageAction::SendNotification {
+                text: format!("Map {} {operation} failed: {e}", self.eeprom_key),
+                kind: egui_toast::ToastKind::Error,
+            };
+        }
+        if matches!(write, PendingMapWrite::Ram) {
+            self.state.ram_write_succeeded();
+        } else {
+            match Self::new(self.meta.id, self.ecu_ref.clone(), self.meta.clone()) {
+                Ok(new_data) => self.state = new_data.state,
+                Err(e) => {
+                    return PageAction::SendNotification {
+                        text: format!("{operation} acknowledged, but state refresh failed: {e}"),
+                        kind: egui_toast::ToastKind::Warning,
+                    };
                 }
-                Err(e) => PageAction::SendNotification {
-                    text: format!("Map {} RAM write failed! {}", self.eeprom_key, e),
-                    kind: egui_toast::ToastKind::Error,
-                },
-            },
-            PendingMapWrite::Eeprom => match self.save_to_eeprom() {
-                Ok(_) => {
-                    let eeprom_key = self.eeprom_key.clone();
-                    let lookup_cache_ui_settings = self.lookup_cache.ui_settings();
-                    if let Ok(new_data) =
-                        Self::new(self.meta.id, self.ecu_ref.clone(), self.meta.clone())
-                    {
-                        *self = new_data;
-                        self.lookup_cache
-                            .apply_ui_settings(lookup_cache_ui_settings);
-                    }
-                    PageAction::SendNotification {
-                        text: format!("Map {} EEPROM save OK!", eeprom_key),
-                        kind: egui_toast::ToastKind::Success,
-                    }
-                }
-                Err(e) => PageAction::SendNotification {
-                    text: format!("Map {} EEPROM save failed! {}", self.eeprom_key, e),
-                    kind: egui_toast::ToastKind::Error,
-                },
-            },
+            }
+        }
+        PageAction::SendNotification {
+            text: format!("Map {} {operation} OK!", self.eeprom_key),
+            kind: egui_toast::ToastKind::Success,
         }
     }
 
@@ -1204,9 +1203,9 @@ impl Map {
         active_lookup_points: &[ActiveLookupCachePoint],
     ) {
         let hash = match self.view_type {
-            MapViewType::EEPROM => &self.data_eeprom,
+            MapViewType::EEPROM => &self.state.eeprom,
             MapViewType::Default => &self.data_program,
-            MapViewType::Modify => &self.data_modify,
+            MapViewType::Modify => &self.state.edited,
         }
         .clone();
         let dark_mode = raw_ui.visuals().dark_mode;
@@ -1284,7 +1283,7 @@ impl Map {
                                     MapViewType::EEPROM => {
                                         let response = cell.label(format!(
                                             "{}",
-                                            self.data_eeprom
+                                            self.state.eeprom
                                                 [(row_id * self.x_values.len()) + x_pos]
                                         ));
                                         Self::decorate_lookup_cache_cell(
@@ -1311,11 +1310,11 @@ impl Map {
                                     }
                                     MapViewType::Modify => {
                                         let map_idx = (row_id * self.x_values.len()) + x_pos;
-                                        if self.data_modify[map_idx] != self.data_eeprom[map_idx] {
+                                        if self.state.cell_is_edited(map_idx) {
                                             cell.style_mut().visuals.override_text_color =
                                                 Some(cell_edit_color)
                                         }
-                                        let edit = DragValue::new(&mut self.data_modify[map_idx])
+                                        let edit = DragValue::new(&mut self.state.edited[map_idx])
                                             .suffix(self.meta.value_unit)
                                             .update_while_editing(false)
                                             .speed(0);
@@ -1360,19 +1359,16 @@ impl Map {
                     }
                 }
             }
-            if ui.button("Save to file").clicked() {
-                if self.data_eeprom != self.data_modify || self.data_memory != self.data_eeprom {
-                    action = Some(PageAction::SendNotification {
-                        text:
-                            "You have unsaved data in the map. Please write to EEPROM before saving"
-                                .into(),
-                        kind: egui_toast::ToastKind::Warning,
-                    });
-                } else {
-                    save_map(&self);
-                }
+            if ui.button("Save local map to file").clicked() {
+                save_map(self);
             }
         });
+        if self.state.has_local_edits() {
+            raw_ui.colored_label(Color32::YELLOW, "Local edits have not been written to RAM.");
+        }
+        if self.state.ram_differs_from_eeprom() {
+            raw_ui.label("Last known RAM differs from EEPROM.");
+        }
         raw_ui.horizontal(|row| {
             row.strong("Viewing:");
             row.selectable_value(&mut self.view_type, MapViewType::Modify, "User changes");
@@ -1380,36 +1376,30 @@ impl Map {
             row.selectable_value(&mut self.view_type, MapViewType::Default, "TCU default");
         });
         raw_ui.horizontal(|raw_ui| {
-            raw_ui.add_enabled_ui(self.data_modify != self.data_program, |ui| {
+            raw_ui.add_enabled_ui(self.state.edited != self.data_program, |ui| {
                 if ui.button("Reset to flash defaults").clicked() {
-                    self.data_modify = self.data_program.clone();
+                    self.state.edited = self.data_program.clone();
                 }
             });
-            raw_ui.add_enabled_ui(self.data_modify != self.data_eeprom, |ui| {
-                if ui.button("Undo user changes").clicked() {
-                    action = match self.undo_changes() {
-                        Ok(_) => {
-                            self.data_modify = self.data_eeprom.clone();
-                            Some(PageAction::SendNotification {
-                                text: format!("Map {} undo OK!", self.eeprom_key),
-                                kind: egui_toast::ToastKind::Success,
-                            })
-                        }
-                        Err(e) => Some(PageAction::SendNotification {
-                            text: format!("Map {} undo failed! {}", self.eeprom_key, e),
-                            kind: egui_toast::ToastKind::Error,
-                        }),
-                    };
+            raw_ui.add_enabled_ui(self.state.has_local_edits(), |ui| {
+                if ui.button("Undo local edits").clicked() {
+                    self.state.discard_local_edits();
                 }
-                if ui.button("Write changes (To RAM)").clicked() {
+                if ui.button("Write local edits to RAM").clicked() {
                     action = Some(self.request_map_write(PendingMapWrite::Ram));
                 }
             });
-            raw_ui.add_enabled_ui(self.data_memory != self.data_eeprom, |ui| {
-                if ui.button("Write changes (To EEPROM)").clicked() {
-                    action = Some(self.request_map_write(PendingMapWrite::Eeprom));
-                }
-            });
+            raw_ui.add_enabled_ui(
+                !self.state.has_local_edits() && self.state.ram_differs_from_eeprom(),
+                |ui| {
+                    if ui.button("Save RAM to EEPROM").clicked() {
+                        action = Some(self.request_map_write(PendingMapWrite::Eeprom));
+                    }
+                    if ui.button("Restore RAM from EEPROM").clicked() {
+                        action = Some(self.request_map_write(PendingMapWrite::RestoreEeprom));
+                    }
+                },
+            );
         });
         self.update_lookup_cache_poll(raw_ui.ctx(), action.is_some());
         if action.is_none() {
@@ -1426,8 +1416,8 @@ impl Map {
                     // Bar chart
                     let src = match self.view_type {
                         MapViewType::Default => &self.data_program,
-                        MapViewType::EEPROM => &self.data_eeprom,
-                        MapViewType::Modify => &self.data_modify,
+                        MapViewType::EEPROM => &self.state.eeprom,
+                        MapViewType::Modify => &self.state.edited,
                     };
                     let mut bars = Vec::new();
                     for x in 0..self.y_values.len() {
@@ -1495,8 +1485,8 @@ impl Map {
                     // Line chart
                     let src = match self.view_type {
                         MapViewType::Default => &self.data_program,
-                        MapViewType::EEPROM => &self.data_eeprom,
-                        MapViewType::Modify => &self.data_modify,
+                        MapViewType::EEPROM => &self.state.eeprom,
+                        MapViewType::Modify => &self.state.edited,
                     };
                     let mut lines: Vec<Line> = Vec::new();
                     for (y_idx, _key) in self.y_values.iter().enumerate() {
@@ -1573,8 +1563,8 @@ impl Map {
                 } else {
                     let src = match self.view_type {
                         MapViewType::Default => &self.data_program,
-                        MapViewType::EEPROM => &self.data_eeprom,
-                        MapViewType::Modify => &self.data_modify,
+                        MapViewType::EEPROM => &self.state.eeprom,
+                        MapViewType::Modify => &self.state.edited,
                     };
                     let desired_size =
                         egui::Vec2::new(raw_ui.available_width(), raw_ui.available_height());
@@ -1637,7 +1627,9 @@ impl Map {
                                     src[(len * y_idx) + x_idx] as f64
                                 },
                             )
-                            .style_func(&|&v| (&HSLColor(((v-y_min) / (y_max - y_min)) * 0.3, 1.0, 0.5)).into()),
+                            .style_func(&|&v| {
+                                (&HSLColor(((v - y_min) / (y_max - y_min)) * 0.3, 1.0, 0.5)).into()
+                            }),
                         )
                         .unwrap();
                     let x_step = ((x_max - x_min) * 0.015).max(1.0);
@@ -1697,9 +1689,9 @@ impl Map {
 
     pub fn current_viewed_data(&self) -> &[i16] {
         match self.view_type {
-            MapViewType::EEPROM => &self.data_eeprom,
-            MapViewType::Default => &self.data_memory,
-            MapViewType::Modify => &self.data_modify,
+            MapViewType::EEPROM => &self.state.eeprom,
+            MapViewType::Default => &self.data_program,
+            MapViewType::Modify => &self.state.edited,
         }
     }
 }
@@ -1709,7 +1701,7 @@ pub fn save_map(map: &Map) {
         id: map.meta.id as u8,
         x_values: map.x_values.clone(),
         y_values: map.y_values.clone(),
-        state: map.data_eeprom.clone(),
+        state: map.state.edited.clone(),
     };
     if let Some(picked) = rfd::FileDialog::new()
         .set_title(format!("Save map {}", map.meta.name))
@@ -1751,13 +1743,13 @@ pub fn load_map(map: &mut Map) -> Option<Result<(), String>> {
                     "Y sizes differ! Map spec has changed. Saved map is no longer valid"
                 )));
             }
-            if data.state.len() != map.data_eeprom.len() {
+            if data.state.len() != map.state.eeprom.len() {
                 return Some(Err(format!(
                     "Z sizes differ! Map spec has changed. Saved map is no longer valid"
                 )));
             }
             // All OK!
-            map.data_modify = data.state;
+            map.state.edited = data.state;
             return Some(Ok(()));
         }
         Err(e) => return Some(Err(e)),
@@ -2013,13 +2005,15 @@ impl super::InterfacePage for MapEditor {
             // Stop user changing maps if they have unsaved changes
             let mut allowed_to_swtich = true;
             if let Some(current_map) = self.loaded_map.as_ref() {
-                if current_map.data_modify != current_map.data_eeprom {
+                if current_map.state.has_local_edits() {
                     allowed_to_swtich = false;
                 }
             }
             if !allowed_to_swtich {
                 action = Some(PageAction::SendNotification {
-                    text: "You have uncommited changes, please reset or write to EEPROM".into(),
+                    text:
+                        "You have local edits. Undo them or write them to RAM before changing maps."
+                            .into(),
                     kind: egui_toast::ToastKind::Warning,
                 })
             } else {
