@@ -105,7 +105,7 @@ pub struct Map {
     pitch: f64,
     rot: f64,
     lookup_cache: LookupCacheState,
-    pending_write: Option<PendingMapWrite>,
+    pending_operation: Option<PendingMapOperation>,
 }
 
 fn read_i16(a: &[u8]) -> DiagServerResult<(&[u8], i16)> {
@@ -272,10 +272,11 @@ struct LookupCacheWorkerResult {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PendingMapWrite {
+enum PendingMapOperation {
     Ram,
     Eeprom,
     RestoreEeprom,
+    Refresh,
 }
 
 #[derive(Debug)]
@@ -297,12 +298,6 @@ struct LookupCacheState {
     last_poll_started: Option<Instant>,
     last_data_received: Option<Instant>,
     last_error_at: Option<Instant>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LookupCacheUiSettings {
-    enabled: bool,
-    poll_hz: f32,
 }
 
 impl Clone for LookupCacheState {
@@ -349,20 +344,6 @@ impl LookupCacheState {
                 .clamp(LOOKUP_CACHE_MIN_POLL_HZ, LOOKUP_CACHE_MAX_POLL_HZ),
         )
     }
-
-    fn ui_settings(&self) -> LookupCacheUiSettings {
-        LookupCacheUiSettings {
-            enabled: self.enabled,
-            poll_hz: self.poll_hz,
-        }
-    }
-
-    fn apply_ui_settings(&mut self, settings: LookupCacheUiSettings) {
-        self.enabled = settings.enabled;
-        self.poll_hz = settings.poll_hz;
-        self.clamp_poll_hz();
-        self.next_poll = Instant::now();
-    }
 }
 
 impl Map {
@@ -382,9 +363,11 @@ impl Map {
                     ],
                     None,
                 )
-                .map(|mut x| {
-                    x.drain(0..1);
-                    x
+                .and_then(|response| {
+                    if response.first() != Some(&KWP_POSITIVE_READ_DATA_BY_LOCAL_IDENTIFIER) {
+                        return Err(DiagError::InvalidResponseLength);
+                    }
+                    Ok(response[1..].to_vec())
                 })
         })?;
         let (data, data_len) = read_u16(&ecu_response)?;
@@ -394,7 +377,12 @@ impl Map {
         let (data, x_element_count) = read_u16(data)?;
         let (data, y_element_count) = read_u16(data)?;
         let (mut data, key_len) = read_u16(data)?;
-        if data.len() as u16 != ((x_element_count + y_element_count) * 2) + key_len {
+        if x_element_count == 0
+            || y_element_count == 0
+            || data.len()
+                != (usize::from(x_element_count) + usize::from(y_element_count)) * 2
+                    + usize::from(key_len)
+        {
             return Err(DiagError::InvalidResponseLength);
         }
         let mut x_elements: Vec<i16> = Vec::new();
@@ -409,95 +397,16 @@ impl Map {
             y_elements.push(v);
             data = d;
         }
-        let key = String::from_utf8(data.to_vec()).unwrap();
+        let key = String::from_utf8(data.to_vec()).map_err(|_| DiagError::InvalidResponseLength)?;
 
-        let mut default: Vec<i16> = Vec::new();
-        let mut current: Vec<i16> = Vec::new();
-        let mut eeprom: Vec<i16> = Vec::new();
-
-        // Read current data
-        let ecu_response = nag.with_kwp(|server| {
-            server
-                .send_byte_array_with_response(
-                    &[
-                        KwpCommand::ReadDataByLocalIdentifier.into(),
-                        0x19,
-                        map_id as u8,
-                        MapCmd::Read as u8,
-                        0x00,
-                        0x00,
-                    ],
-                    None,
-                )
-                .map(|mut x| {
-                    x.drain(0..1);
-                    x
-                })
+        let count = usize::from(x_element_count) * usize::from(y_element_count);
+        let (current, default, eeprom) = nag.with_kwp(|server| {
+            Ok((
+                Self::read_values(server, map_id, MapCmd::Read, count)?,
+                Self::read_values(server, map_id, MapCmd::ReadDefault, count)?,
+                Self::read_values(server, map_id, MapCmd::ReadEEPROM, count)?,
+            ))
         })?;
-        let (mut c_data, c_arr_size) = read_u16(&ecu_response)?;
-        if c_data.len() != c_arr_size as usize {
-            return Err(DiagError::InvalidResponseLength);
-        }
-        for _ in 0..(c_arr_size / 2) {
-            let (d, v) = read_i16(c_data)?;
-            current.push(v);
-            c_data = d;
-        }
-        // Read default data
-        let ecu_response = nag.with_kwp(|server| {
-            server
-                .send_byte_array_with_response(
-                    &[
-                        KwpCommand::ReadDataByLocalIdentifier.into(),
-                        0x19,
-                        map_id as u8,
-                        MapCmd::ReadDefault as u8,
-                        0x00,
-                        0x00,
-                    ],
-                    None,
-                )
-                .map(|mut x| {
-                    x.drain(0..1);
-                    x
-                })
-        })?;
-        let (mut d_data, d_arr_size) = read_u16(&ecu_response)?;
-        if d_data.len() != d_arr_size as usize {
-            return Err(DiagError::InvalidResponseLength);
-        }
-        for _ in 0..(d_arr_size / 2) {
-            let (d, v) = read_i16(d_data)?;
-            default.push(v);
-            d_data = d;
-        }
-        let ecu_response = nag.with_kwp(|server| {
-            server
-                .send_byte_array_with_response(
-                    &[
-                        KwpCommand::ReadDataByLocalIdentifier.into(),
-                        0x19,
-                        map_id as u8,
-                        MapCmd::ReadEEPROM as u8,
-                        0x00,
-                        0x00,
-                    ],
-                    None,
-                )
-                .map(|mut x| {
-                    x.drain(0..1);
-                    x
-                })
-        })?;
-        let (mut e_data, e_arr_size) = read_u16(&ecu_response)?;
-        if e_data.len() != e_arr_size as usize {
-            return Err(DiagError::InvalidResponseLength);
-        }
-        for _ in 0..(e_arr_size / 2) {
-            let (d, v) = read_i16(e_data)?;
-            eeprom.push(v);
-            e_data = d;
-        }
 
         let time_sync = Self::read_tcu_time_sync_blocking(&nag).ok();
 
@@ -516,8 +425,56 @@ impl Map {
                 time_sync,
                 ..LookupCacheState::default()
             },
-            pending_write: None,
+            pending_operation: None,
         })
+    }
+
+    fn read_values(
+        server: &DynamicDiagSession,
+        map_id: MapType,
+        command: MapCmd,
+        count: usize,
+    ) -> DiagServerResult<Vec<i16>> {
+        let response = server.send_byte_array_with_response(
+            &[
+                KwpCommand::ReadDataByLocalIdentifier.into(),
+                0x19,
+                map_id as u8,
+                command as u8,
+                0,
+                0,
+            ],
+            None,
+        )?;
+        Self::parse_values(&response, count)
+    }
+
+    fn parse_values(response: &[u8], count: usize) -> DiagServerResult<Vec<i16>> {
+        if response.first() != Some(&KWP_POSITIVE_READ_DATA_BY_LOCAL_IDENTIFIER) {
+            return Err(DiagError::InvalidResponseLength);
+        }
+        let (data, length) = read_u16(&response[1..])?;
+        if data.len() != usize::from(length) || data.len() != count * 2 {
+            return Err(DiagError::InvalidResponseLength);
+        }
+        Ok(data
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect())
+    }
+
+    fn refresh_from_ecu(&mut self) -> Result<(), String> {
+        let count = self.x_values.len() * self.y_values.len();
+        let result = self
+            .ecu_ref
+            .with_kwp(|server| {
+                Ok((
+                    Self::read_values(server, self.meta.id, MapCmd::Read, count)?,
+                    Self::read_values(server, self.meta.id, MapCmd::ReadEEPROM, count)?,
+                ))
+            })
+            .map_err(|error| error.to_string());
+        self.state.apply_read(result)
     }
 
     fn data_to_byte_array(&self, data: &Vec<i16>) -> Vec<u8> {
@@ -866,7 +823,7 @@ impl Map {
         if !self.lookup_cache.enabled
             || self.lookup_cache.disabled
             || skip_start
-            || self.pending_write.is_some()
+            || self.pending_operation.is_some()
             || self.lookup_cache.in_flight.is_some()
         {
             return;
@@ -1114,71 +1071,124 @@ impl Map {
         Some(lerp(top, bottom, y_factor))
     }
 
-    fn perform_map_write(&mut self, write: PendingMapWrite) -> PageAction {
-        if !matches!(write, PendingMapWrite::Ram) && self.state.has_local_edits() {
+    fn perform_map_operation(&mut self, operation: PendingMapOperation) -> PageAction {
+        // Re-read before writing: the ECU may have adapted or saved its RAM since opening.
+        if let Err(error) = self.refresh_from_ecu() {
+            return PageAction::SendNotification {
+                text: format!(
+                    "Could not refresh map {}: {error}. No write was sent.",
+                    self.eeprom_key
+                ),
+                kind: egui_toast::ToastKind::Error,
+            };
+        }
+        if matches!(operation, PendingMapOperation::Refresh) {
+            return PageAction::SendNotification {
+                text: if self.state.has_conflict() {
+                    "Map refreshed. ECU RAM changed; resolve the conflict before writing.".into()
+                } else {
+                    "Map refreshed from ECU. Local edits were preserved.".into()
+                },
+                kind: if self.state.has_conflict() {
+                    egui_toast::ToastKind::Warning
+                } else {
+                    egui_toast::ToastKind::Success
+                },
+            };
+        }
+        if self.state.has_conflict() {
+            return PageAction::SendNotification {
+                text: "ECU RAM changed since editing began. Choose which version to keep before writing.".into(),
+                kind: egui_toast::ToastKind::Warning,
+            };
+        }
+        if !matches!(operation, PendingMapOperation::Ram) && self.state.has_local_edits() {
             return PageAction::SendNotification {
                 text: "Undo local edits or write them to RAM first.".into(),
                 kind: egui_toast::ToastKind::Warning,
             };
         }
-        let result = match write {
-            PendingMapWrite::Ram => self.write_to_ram(),
-            PendingMapWrite::Eeprom => self.save_to_eeprom(),
-            PendingMapWrite::RestoreEeprom => self.undo_changes(),
+        let needed = match operation {
+            PendingMapOperation::Ram => self.state.has_local_edits(),
+            _ => self.state.ram_differs_from_eeprom(),
         };
-        let operation = match write {
-            PendingMapWrite::Ram => "RAM write",
-            PendingMapWrite::Eeprom => "EEPROM save",
-            PendingMapWrite::RestoreEeprom => "Restore RAM from EEPROM",
-        };
-        if let Err(e) = result {
+        if !needed {
             return PageAction::SendNotification {
-                text: format!("Map {} {operation} failed: {e}", self.eeprom_key),
+                text: "ECU state refreshed; no write is needed.".into(),
+                kind: egui_toast::ToastKind::Info,
+            };
+        }
+        let result = match operation {
+            PendingMapOperation::Ram => self.write_to_ram(),
+            PendingMapOperation::Eeprom => self.save_to_eeprom(),
+            PendingMapOperation::RestoreEeprom => self.undo_changes(),
+            PendingMapOperation::Refresh => unreachable!(),
+        };
+        let label = match operation {
+            PendingMapOperation::Ram => "RAM write",
+            PendingMapOperation::Eeprom => "EEPROM save",
+            PendingMapOperation::RestoreEeprom => "Restore RAM from EEPROM",
+            PendingMapOperation::Refresh => unreachable!(),
+        };
+        if let Err(error) = result {
+            // A lost response does not prove the ECU rejected the operation.
+            self.state.read_error =
+                Some(format!("{label} failed: {error}. Refresh the ECU state."));
+            return PageAction::SendNotification {
+                text: format!("Map {} {label} failed: {error}", self.eeprom_key),
                 kind: egui_toast::ToastKind::Error,
             };
         }
-        if matches!(write, PendingMapWrite::Ram) {
-            self.state.ram_write_succeeded();
-        } else {
-            match Self::new(self.meta.id, self.ecu_ref.clone(), self.meta.clone()) {
-                Ok(new_data) => self.state = new_data.state,
-                Err(e) => {
-                    return PageAction::SendNotification {
-                        text: format!("{operation} acknowledged, but state refresh failed: {e}"),
-                        kind: egui_toast::ToastKind::Warning,
-                    };
-                }
-            }
+        if let Err(error) = self.refresh_from_ecu() {
+            return PageAction::SendNotification {
+                text: format!("{label} acknowledged, but state refresh failed: {error}"),
+                kind: egui_toast::ToastKind::Warning,
+            };
+        }
+        let confirmed = match operation {
+            PendingMapOperation::Ram => self.state.confirm_ram_write(),
+            _ => !self.state.ram_differs_from_eeprom(),
+        };
+        if !confirmed {
+            return PageAction::SendNotification {
+                text: format!(
+                    "{label} acknowledged, but readback differs from the requested state. Local edits were preserved; review the ECU state."
+                ),
+                kind: egui_toast::ToastKind::Warning,
+            };
         }
         PageAction::SendNotification {
-            text: format!("Map {} {operation} OK!", self.eeprom_key),
+            text: format!(
+                "Map {} {label} acknowledged; ECU state refreshed.",
+                self.eeprom_key
+            ),
             kind: egui_toast::ToastKind::Success,
         }
     }
 
-    fn request_map_write(&mut self, write: PendingMapWrite) -> PageAction {
+    fn request_map_operation(&mut self, write: PendingMapOperation) -> PageAction {
         if self.lookup_cache.in_flight.is_some() {
-            self.pending_write = Some(write);
-            self.lookup_cache.status = "write queued";
+            self.pending_operation = Some(write);
+            self.lookup_cache.status = "map operation queued";
             PageAction::SendNotification {
                 text: format!(
-                    "Map {} write queued until live cursor request finishes.",
+                    "Map {} operation queued until live cursor request finishes.",
                     self.eeprom_key
                 ),
                 kind: egui_toast::ToastKind::Info,
             }
         } else {
-            self.pending_write = None;
-            self.perform_map_write(write)
+            self.pending_operation = None;
+            self.perform_map_operation(write)
         }
     }
 
-    fn execute_pending_write(&mut self) -> Option<PageAction> {
+    fn execute_pending_operation(&mut self) -> Option<PageAction> {
         if self.lookup_cache.in_flight.is_some() {
             return None;
         }
-        let write = self.pending_write.take()?;
-        Some(self.perform_map_write(write))
+        let write = self.pending_operation.take()?;
+        Some(self.perform_map_operation(write))
     }
 
     fn get_x_label(&self, idx: usize) -> String {
@@ -1338,36 +1348,80 @@ impl Map {
     fn generate_window_ui(&mut self, raw_ui: &mut egui::Ui) -> Option<PageAction> {
         let mut action = None;
         let dark_mode = raw_ui.visuals().dark_mode;
-        raw_ui.horizontal(|ui| {
-            if ui.button("Load from file").clicked() {
-                let mut copy = self.clone();
-                if let Some(res) = load_map(&mut copy) {
-                    match res {
-                        Ok(_) => {
-                            *self = copy;
-                            action = Some(PageAction::SendNotification {
-                                text: format!("Map loading OK!"),
-                                kind: egui_toast::ToastKind::Success,
-                            });
-                        }
-                        Err(e) => {
-                            action = Some(PageAction::SendNotification {
-                                text: format!("Map loading failed: {e}"),
-                                kind: egui_toast::ToastKind::Error,
-                            });
+        raw_ui.add_enabled_ui(self.pending_operation.is_none(), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Load from file").clicked() {
+                    if let Some(res) = load_map(self) {
+                        match res {
+                            Ok(_) => {
+                                action = Some(PageAction::SendNotification {
+                                    text: format!("Map loading OK!"),
+                                    kind: egui_toast::ToastKind::Success,
+                                });
+                            }
+                            Err(e) => {
+                                action = Some(PageAction::SendNotification {
+                                    text: format!("Map loading failed: {e}"),
+                                    kind: egui_toast::ToastKind::Error,
+                                });
+                            }
                         }
                     }
                 }
-            }
-            if ui.button("Save local map to file").clicked() {
-                save_map(self);
-            }
+                if ui.button("Save local map to file").clicked() {
+                    save_map(self);
+                }
+            });
         });
+        raw_ui.ctx().request_repaint_after(Duration::from_secs(1));
+        raw_ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    self.pending_operation.is_none(),
+                    egui::Button::new("Refresh from ECU"),
+                )
+                .clicked()
+            {
+                action = Some(self.request_map_operation(PendingMapOperation::Refresh));
+            }
+            ui.label(format!(
+                "Last ECU read: {} seconds ago",
+                self.state.last_read.elapsed().as_secs()
+            ));
+        });
+        if let Some(error) = &self.state.read_error {
+            raw_ui.colored_label(
+                raw_ui.visuals().warn_fg_color,
+                format!("ECU snapshot is stale: {error}"),
+            );
+        }
         if self.state.has_local_edits() {
-            raw_ui.colored_label(Color32::YELLOW, "Local edits have not been written to RAM.");
+            raw_ui.colored_label(
+                raw_ui.visuals().warn_fg_color,
+                "Local edits have not been written to RAM.",
+            );
         }
         if self.state.ram_differs_from_eeprom() {
-            raw_ui.label("Last known RAM differs from EEPROM.");
+            raw_ui.label("Last read: RAM differs from EEPROM. Refresh to check whether the ECU has saved it.");
+        }
+        if self.state.has_conflict() {
+            raw_ui.colored_label(
+                raw_ui.visuals().warn_fg_color,
+                "Conflict: ECU RAM changed since editing began.",
+            );
+            raw_ui.add_enabled_ui(
+                self.pending_operation.is_none() && self.state.read_error.is_none(),
+                |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Keep local version for next RAM write").clicked() {
+                            self.state.keep_local_version();
+                        }
+                        if ui.button("Use last read ECU RAM").clicked() {
+                            self.state.discard_local_edits();
+                        }
+                    });
+                },
+            );
         }
         raw_ui.horizontal(|row| {
             row.strong("Viewing:");
@@ -1375,39 +1429,45 @@ impl Map {
             row.selectable_value(&mut self.view_type, MapViewType::EEPROM, "EEPROM");
             row.selectable_value(&mut self.view_type, MapViewType::Default, "TCU default");
         });
-        raw_ui.horizontal(|raw_ui| {
-            raw_ui.add_enabled_ui(self.state.edited != self.data_program, |ui| {
-                if ui.button("Reset to flash defaults").clicked() {
-                    self.state.edited = self.data_program.clone();
-                }
-            });
-            raw_ui.add_enabled_ui(self.state.has_local_edits(), |ui| {
-                if ui.button("Undo local edits").clicked() {
-                    self.state.discard_local_edits();
-                }
-                if ui.button("Write local edits to RAM").clicked() {
-                    action = Some(self.request_map_write(PendingMapWrite::Ram));
-                }
-            });
-            raw_ui.add_enabled_ui(
-                !self.state.has_local_edits() && self.state.ram_differs_from_eeprom(),
-                |ui| {
-                    if ui.button("Save RAM to EEPROM").clicked() {
-                        action = Some(self.request_map_write(PendingMapWrite::Eeprom));
+        raw_ui.add_enabled_ui(self.pending_operation.is_none(), |raw_ui| {
+            raw_ui.horizontal_wrapped(|raw_ui| {
+                raw_ui.add_enabled_ui(self.state.edited != self.data_program, |ui| {
+                    if ui.button("Reset to flash defaults").clicked() {
+                        self.state.edited = self.data_program.clone();
                     }
-                    if ui.button("Restore RAM from EEPROM").clicked() {
-                        action = Some(self.request_map_write(PendingMapWrite::RestoreEeprom));
+                });
+                raw_ui.add_enabled_ui(self.state.has_local_edits(), |ui| {
+                    if ui.button("Undo local edits").clicked() {
+                        self.state.discard_local_edits();
                     }
-                },
-            );
+                    if ui.button("Write local edits to RAM").clicked() {
+                        action = Some(self.request_map_operation(PendingMapOperation::Ram));
+                    }
+                });
+                raw_ui.add_enabled_ui(
+                    !self.state.has_local_edits() && self.state.ram_differs_from_eeprom(),
+                    |ui| {
+                        if ui.button("Save RAM to EEPROM").clicked() {
+                            action = Some(self.request_map_operation(PendingMapOperation::Eeprom));
+                        }
+                        if ui.button("Restore RAM from EEPROM").clicked() {
+                            action = Some(
+                                self.request_map_operation(PendingMapOperation::RestoreEeprom),
+                            );
+                        }
+                    },
+                );
+            });
         });
         self.update_lookup_cache_poll(raw_ui.ctx(), action.is_some());
         if action.is_none() {
-            action = self.execute_pending_write();
+            action = self.execute_pending_operation();
         }
         let active_lookup_points = self.active_lookup_cache_points();
         self.show_lookup_cache_controls(raw_ui, &active_lookup_points);
-        self.gen_edit_table(raw_ui, &active_lookup_points);
+        raw_ui.add_enabled_ui(self.pending_operation.is_none(), |ui| {
+            self.gen_edit_table(ui, &active_lookup_points);
+        });
         ScrollArea::new([true, true])
             .max_height(raw_ui.available_height())
             .show(raw_ui, |raw_ui| {
@@ -2005,14 +2065,14 @@ impl super::InterfacePage for MapEditor {
             // Stop user changing maps if they have unsaved changes
             let mut allowed_to_swtich = true;
             if let Some(current_map) = self.loaded_map.as_ref() {
-                if current_map.state.has_local_edits() {
+                if current_map.state.has_local_edits() || current_map.pending_operation.is_some() {
                     allowed_to_swtich = false;
                 }
             }
             if !allowed_to_swtich {
                 action = Some(PageAction::SendNotification {
                     text:
-                        "You have local edits. Undo them or write them to RAM before changing maps."
+                        "Finish the pending map operation or undo/write local edits before changing maps."
                             .into(),
                     kind: egui_toast::ToastKind::Warning,
                 })
@@ -2063,5 +2123,35 @@ impl super::InterfacePage for MapEditor {
 
     fn should_show_statusbar(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Map;
+
+    #[test]
+    fn map_read_decodes_signed_values() {
+        assert_eq!(
+            Map::parse_values(&[0x61, 4, 0, 0xff, 0xff, 10, 0], 2).unwrap(),
+            vec![-1, 10]
+        );
+    }
+
+    #[test]
+    fn map_read_rejects_invalid_service_length_and_dimensions() {
+        for response in [
+            vec![],
+            vec![0x61],
+            vec![0x62, 2, 0, 1, 0],
+            vec![0x61, 4, 0, 1, 0],
+            vec![0x61, 3, 0, 1, 0, 2],
+            vec![0x61, 4, 0, 1, 0, 2, 0],
+        ] {
+            assert!(
+                Map::parse_values(&response, 1).is_err(),
+                "Accepted invalid response: {response:?}"
+            );
+        }
     }
 }
